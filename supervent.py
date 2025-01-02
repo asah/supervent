@@ -6,51 +6,34 @@ import uuid
 import asyncio
 import aiohttp
 import math
-import yaml
 import argparse
 import signal
 import sys
+import numpy as np
 import psycopg2
-from psycopg2.extras import execute_values
-from psycopg2.pool import SimpleConnectionPool
-from contextlib import asynccontextmanager
+from faker import Faker
+import logging
 
 DEFAULT_BATCH_SIZE = 100
 
-class AsyncPgPool:
-    def __init__(self, dsn, min_size=1, max_size=10):
-        self.pool = SimpleConnectionPool(min_size, max_size, dsn)
-        self._loop = asyncio.get_event_loop()
-        
-    @asynccontextmanager
-    async def acquire(self):
-        conn = await self._loop.run_in_executor(None, self.pool.getconn)
-        try:
-            yield conn
-        finally:
-            await self._loop.run_in_executor(None, self.pool.putconn, conn)
-
 class EventGenerator:
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, dataset, api_key, batch_size=DEFAULT_BATCH_SIZE, postgres_config=None):
+        self.dataset = dataset
+        self.api_key = api_key
+        self.url = f"https://api.axiom.co/v1/datasets/{dataset}/ingest"
+        self.batch_size = batch_size
         self.batch = []
-        self.axiom_url = f"https://api.axiom.co/v1/datasets/{args.axiom_dataset}/ingest"
-        if self.args.pgconn:
-            self.pg_pool = AsyncPgPool(self.args.pgconn)
-            asyncio.create_task(self.setup_postgres())
+        self.postgres_conn = None
 
-    async def setup_postgres(self):
-        async with self.pg_pool.acquire() as conn:
-            cur = conn.cursor()
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {self.args.pgtable} (
-                    id SERIAL PRIMARY KEY,
-                    data JSONB,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
-            cur.close()
+        if postgres_config:
+            self.postgres_conn = psycopg2.connect(
+                host=postgres_config['host'],
+                port=postgres_config['port'],
+                dbname=postgres_config['dbname'],
+                user=postgres_config['user'],
+                password=postgres_config['password']
+            )
+            logging.debug("PostgreSQL connection established")
 
     async def emit(self, record):
         # Strip "custom." prefix from keys
@@ -59,137 +42,130 @@ class EventGenerator:
         stripped_record['_time'] = datetime.now(timezone.utc).isoformat()
 
         self.batch.append(stripped_record)
-        if len(self.batch) >= self.args.batchsize:
+        if len(self.batch) >= self.batch_size:
             await self.send_batch()
 
     async def send_batch(self):
         if not self.batch:
+            logging.debug("Batch is empty, nothing to send")
             return
+        # print("sending batch")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.url, headers=headers, json=self.batch) as response:
+                if response.status != 200:
+                    logging.error(f"Error occurred while sending the batch, status code: {response.status}")
+                else:
+                    logging.debug("Batch sent successfully")
 
-        if self.args.axiom_api_key != '':
-            # print("sending batch")
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.args.axiom_api_key}"
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.axiom_url, headers=headers, json=self.batch) as response:
-                    if response.status != 200:
-                        print(f"Failed to send batch to axiom: {response.status}")
-                # else:
-                    # print("Batch sent successfully")
-
-        if self.args.pgconn:
-            try:
-                async with self.pg_pool.acquire() as conn:
-                    cur = conn.cursor()
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        execute_values,
-                        cur,
-                        f"INSERT INTO {self.args.pgtable} (data) VALUES %s",
-                        [(json.dumps(record),) for record in self.batch]
-                    )
-                    conn.commit()
-                    cur.close()
-            except Exception as e:
-                print(f"Failed to send batch to PostgreSQL: {e}")
+        if self.postgres_conn:
+            self.send_to_postgres(self.batch)
 
         self.batch = []
 
-# Load configuration from config.json
+    def send_to_postgres(self, batch):
+        cursor = self.postgres_conn.cursor()
+        for record in batch:
+            columns = record.keys()
+            values = [record[column] for column in columns]
+            insert_statement = f"INSERT INTO {self.dataset} ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(values))})"
+            cursor.execute(insert_statement, values)
+        self.postgres_conn.commit()
+        cursor.close()
+
+# Load configuration from sources.json
 def load_config(file_path):
-    with open(file_path, 'r') as file:
-        config = json.load(file)
-    return config
+    try:
+        with open(file_path, 'r') as file:
+            config = json.load(file)
+        logging.debug("Configuration loaded successfully")
+        return config
+    except Exception as e:
+        logging.error(f"Failed to load configuration: {e}")
+        sys.exit(1)
+
+# Generate usernames based on the specified groups
+def generate_usernames(groups_config):
+    usernames = {}
+    for group_name, group_details in groups_config.items():
+        regions = group_details.get('regions', ['en_US'])  # Default to 'en_US' if no region is specified
+        count = group_details['count']
+        usernames[group_name] = []
+
+        # Distribute the count evenly across the regions
+        names_per_region = count // len(regions)
+        extra_names = count % len(regions)
+
+        for region in regions:
+            Faker.seed(0)  # Ensure reproducibility
+            fake = Faker(region)
+            for _ in range(names_per_region):
+                usernames[group_name].append(fake.name())
+
+        # Add extra names to make up the total count
+        for _ in range(extra_names):
+            Faker.seed(0)  # Ensure reproducibility
+            fake = Faker(random.choice(regions))
+            usernames[group_name].append(fake.name())
+
+    logging.debug(f"Generated Usernames: {usernames}")
+    return usernames
 
 # Generate a random event based on the source configuration
-def generate_event(source_config):
-    event = {"source": source_config["vendor"]}
+def generate_event(source_config, usernames):
+    event = {"Generated-by": source_config["name"]}
+    if "description" in source_config:
+        event["description"] = source_config["description"]
     for field, details in source_config['fields'].items():
         if details['type'] == 'datetime':
-            if source_config['timestamp_format'] == 'UTC':
-                event[field] = datetime.utcnow().strftime(details.get('format', '%Y-%m-%dT%H:%M:%SZ'))
-            elif source_config['timestamp_format'] == 'ISO':
-                event[field] = datetime.now().isoformat()
-            elif source_config['timestamp_format'] == 'Unix':
-                event[field] = int(time.time())
-            elif source_config['timestamp_format'] == 'RFC3339':
-                event[field] = datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
-            else:
-                event[field] = datetime.now().strftime(source_config['timestamp_format'])
+            event[field] = datetime.now(timezone.utc).strftime(details.get('format', '%Y-%m-%dT%H:%M:%SZ'))
         elif details['type'] == 'string':
-            if 'constraints' in details and 'allowed_values' in details['constraints']:
-                event[field] = random.choice(details['constraints']['allowed_values'])
+            if 'group' in details:
+                group_name = details['group']
+                count = details['count']
+                event[field] = random.choice(usernames[group_name][:count])
+            elif 'allowed_values' in details:
+                event[field] = random.choices(details['allowed_values'], weights=details.get('weights', None))[0]
+            elif details.get('format') == 'ip':
+                event[field] = generate_random_ip_address()
+            elif details.get('format') == 'uuid':
+                event[field] = str(uuid.uuid4())
             else:
-                if field == "message":
-                    if 'formats' in details:
-                        selected_format = random.choice(details['formats'])
-                        event[field] = selected_format.format(
-                            timestamp=datetime.now().strftime(details.get('format', '%Y-%m-%dT%H:%M:%SZ')),
-                            src_ip=generate_random_ip_address() if '{src_ip}' in selected_format else '',
-                            dst_ip=generate_random_ip_address() if '{dst_ip}' in selected_format else '',
-                            ip_address=generate_random_ip_address() if '{ip_address}' in selected_format else ''
-                        )
-                    else:
-                        event[field] = details['format'].format(
-                            timestamp=datetime.now().strftime(details.get('format', '%Y-%m-%dT%H:%M:%SZ')),
-                            src_ip=generate_random_ip_address() if '{src_ip}' in details['format'] else '',
-                            dst_ip=generate_random_ip_address() if '{dst_ip}' in details['format'] else '',
-                            ip_address=generate_random_ip_address() if '{ip_address}' in details['format'] else ''
-                        )
-                else:
-                    event[field] = generate_random_username() if field == "user" else generate_random_ip_address()
+                event[field] = uuid.uuid4().hex
         elif details['type'] == 'int':
-            min_val = int(details.get('constraints', {}).get('min', 0))
-            max_val = int(details.get('constraints', {}).get('max', 100))
-            event[field] = random.randint(min_val, max_val)
-        # Add more types as needed
+            if 'allowed_values' in details:
+                event[field] = random.choices(details['allowed_values'], weights=details.get('weights', None))[0]
+            else:
+                min_val = details['constraints']['min']
+                max_val = details['constraints']['max']
+                event[field] = random.randint(min_val, max_val)
+        # Add more types and distributions as needed
+
+    # Handle message field with placeholders
+    if 'message' in source_config['fields']:
+        message_template = random.choices(source_config['fields']['message']['messages'], weights=source_config['fields']['message'].get('weights', None))[0]
+        event['message'] = replace_placeholders(message_template, event)
+
+    logging.debug(event)  # Debug statement to print the complete event
     return event
 
 # Generate a random IP address
 def generate_random_ip_address():
     return f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 255)}"
 
-# Generate a random username based on Zipf's law
-def generate_random_username():
-    usernames = [
-        "john_doe", "jane_smith", "mohamed_ali", "li_wei", "maria_garcia",
-        "yuki_tanaka", "olga_petrov", "raj_kumar", "fatima_zahra", "chen_wang",
-        "ahmed_hassan", "isabella_rossi", "david_jones", "sophia_martinez", "emily_clark",
-        "noah_brown", "mia_wilson", "lucas_miller", "oliver_davis", "ava_moore",
-        "ethan_taylor", "amelia_anderson", "james_thomas", "harper_jackson", "benjamin_white",
-        "liam_johnson", "emma_rodriguez", "william_lee", "sophia_kim", "mason_martin",
-        "elijah_hernandez", "logan_lopez", "alexander_gonzalez", "sebastian_perez", "daniel_hall",
-        "matthew_young", "henry_king", "jack_wright", "levi_scott", "isaac_green",
-        "gabriel_baker", "julian_adams", "jayden_nelson", "lucas_carter", "anthony_mitchell",
-        "grayson_perez", "dylan_roberts", "leo_turner", "jaxon_phillips", "asher_campbell",
-        "ananya_sharma", "arjun_patel", "priya_singh", "vikram_gupta", "neha_verma",
-        "sanjay_rana", "deepika_kapoor", "ravi_mehta", "sara_khan", "manoj_joshi",
-        "željko_ivanović", "šime_šarić", "đorđe_đorđević", "čedomir_čolić", "žana_živković",
-        "miloš_milošević", "ana_marija", "ivan_ivanov", "petar_petrov", "nikola_nikolić",
-        "marta_novak", "katarina_kovač", "tomaž_tomažič", "matej_matejić", "vanja_vuković",
-        "dragana_dimitrijević", "bojan_bojović", "milica_milovanović", "stefan_stefanović", "vanja_vasić",
-        "igor_ilić", "jelena_jovanović", "marko_marković", "tanja_tomić", "zoran_zorić"
-    ]
-
-    # Generate weights using Zipf's law
-    weights = [1.0 / (i + 1) for i in range(len(usernames))]
-    total_weight = sum(weights)
-    normalized_weights = [w / total_weight for w in weights]
-
-    # Select a username based on the weights
-    r = random.random()
-    cumulative_weight = 0.0
-    for username, weight in zip(usernames, normalized_weights):
-        cumulative_weight += weight
-        if r < cumulative_weight:
-            return username
-    return usernames[-1]
+# Replace placeholders in the message template with actual values
+def replace_placeholders(format, values):
+    for key, value in values.items():
+        placeholder = f"{{{key}}}"
+        format = format.replace(placeholder, str(value))
+    return format
 
 # Signal handler to gracefully exit on ^C or kill signal
 def signal_handler(signal, frame):
-    print("Received interrupt signal, sending remaining events...")
+    logging.info("Received interrupt signal, sending remaining events...")
     if len(event_generator.batch) > 0:
         asyncio.create_task(event_generator.send_batch())
     sys.exit(0)
@@ -197,30 +173,65 @@ def signal_handler(signal, frame):
 # Main function to generate events
 async def main():
     parser = argparse.ArgumentParser(description='Generate and send events.')
-    parser.add_argument('--batchsize', type=int, default='200', help='Max events to send per call')
-    parser.add_argument('--config', type=str, default='config.json', help='Path to the configuration file')
-    parser.add_argument('--axiom-api-key', type=str, default='', help='Axion key (only send to axiom if provided)')
-    parser.add_argument('--axiom-dataset', type=str, default='supervent', help='Name of an Axiom dataset to send events via HTTP for ingest')
-    parser.add_argument('--pgconn', type=str, default='', help='PostgreSQL connect string')
-    parser.add_argument('--pgtable', type=str, default='supervent', help='PostgreSQL destination table')
+    parser.add_argument('--config', type=str, default='sources.json', help='Path to the configuration file')
+    parser.add_argument('--axiom-dataset', type=str, required=True, help='Axiom dataset name')
+    parser.add_argument('--axiom-api-key', type=str, required=True, help='Axiom API key')
+    parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE, help='Batch size for HTTP requests')
+    parser.add_argument('--postgres-host', type=str, help='PostgreSQL host')
+    parser.add_argument('--postgres-port', type=int, default=5432, help='PostgreSQL port')
+    parser.add_argument('--postgres-db', type=str, help='PostgreSQL database name')
+    parser.add_argument('--postgres-user', type=str, help='PostgreSQL user')
+    parser.add_argument('--postgres-password', type=str, help='PostgreSQL password')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'NONE'],
+                        help="Set the logging level")
     args = parser.parse_args()
-    if args.axiom_api_key == '' and args.pgconn == '':
-        print("must provide a destination, either --axiom-api-key or --pgconn")
-        sys.exit(1)
+
+    if args.log_level == 'NONE':
+        logging.basicConfig(level=logging.CRITICAL + 1)  # Disable logging
+    else:
+        logging.basicConfig(level=getattr(logging, args.log_level), format='%(asctime)s - %(levelname)s - %(message)s')
+
+    logging.info("Starting Event Generator")
+
+    # print("Arguments parsed successfully")
 
     config = load_config(args.config)
+    dataset = args.axiom_dataset
+    api_key = args.axiom_api_key
+    batch_size = args.batch_size
+
+    postgres_config = None
+    if args.postgres_host and args.postgres_db and args.postgres_user and args.postgres_password:
+        postgres_config = {
+            'host': args.postgres_host,
+            'port': args.postgres_port,
+            'dbname': args.postgres_db,
+            'user': args.postgres_user,
+            'password': args.postgres_password
+        }
+
     global event_generator
-    event_generator = EventGenerator(args)
+    event_generator = EventGenerator(dataset=dataset, api_key=api_key, batch_size=batch_size, postgres_config=postgres_config)
+
+    # Generate usernames based on the specified groups
+    usernames = generate_usernames(config.get('username_groups', {}))
 
     # Set up signal handling to gracefully exit on ^C or kill signal
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    from functools import partial
+    signal.signal(signal.SIGINT, partial(signal_handler))
+    signal.signal(signal.SIGTERM, partial(signal_handler))
+
+    logging.debug("Starting event generation")
 
     # Generate events in a round-robin fashion indefinitely
     while True:
         for source in config['sources']:
-            event = generate_event(source)
+            event = generate_event(source, usernames)
             await event_generator.emit(event)
+        # await asyncio.sleep(1)  # Add a small delay to avoid tight loop
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Exception occurred: {e}")

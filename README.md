@@ -1,29 +1,107 @@
-# supervent
+# Realistic Log Generator
 
-A synthetic log generator that produces high volumes of realistic log events. Event formats for various sources (an app server, Akamai, etc) are configured in config.json. Behavior of these configured sources will be controlled by defining scenarios (even "normal traffic" is just another scenario) that can be overlaid to simulate real-world patterns, e.g. an outage, Black Friday, a suspicious user, etc. For now, supervent just round-robins through its sources, and adds an extra key-value pair of the form "source: Cisco ASA Firewall" to each event because it's still in testing.
+A configurable, pattern-aware log generator that creates interconnected events across multiple system components. Designed to simulate realistic network ecosystems for demo, testing and training purposes.
 
-There is a Python version and a Go version. They do the same thing. 
+The current implementation, branch 3.0, generates realistic but semantically meaningless events. It's one thing to generate syntactically valid logs, but quite another to generate logs that tell a coherent story about system behavior. Real system events have important patterns and correlations that this simplified version doesn't capture, such as:
 
-# Usage
-Python version:
+- Business hours patterns vs off-hours
+- Realistic error cascades
+- Performance degradation patterns
+- Related sequences of operations (login → view profile → update settings)
+- Geographic and time-zone based access patterns
+- Realistic response times based on operation type
+- Correlated database operations (SELECT before UPDATE)
+- Load-based response time variations
+- Session-based user behaviors
+- Cache hit/miss patterns
+- Fields with very high cardinality
 
-python supervent.py [--config filename.json] 
+We ("we" is me and several LLM collaborators) are patiently but steadily adding support for these aspects of log simulation and expect to be done by the end of January 2025.
 
-Go version:
 
-supervent [--config filename.json]
 
-The default configuration file is config.json.
+## Features
 
-For now, supervent sends events to an Axiom dataset configured in axiom_config.yaml
+- **Configurable Event Sources**: Define custom log sources (web servers, application servers, databases, etc.) through YAML configuration
+- **Event Dependencies**: Model realistic cause-and-effect relationships between events across different system components
+- **Request Correlation**: Track related events through request IDs across the entire system
+- **Flexible Output**: Generate events in standardized formats suitable for common log aggregation tools
+- **Time-Based Generation**: Create events with realistic temporal distributions and patterns
 
-# Roadmap
-This is Phase I of the project. For now I am focused on creating realistic events. I am not an expert at event formats. Corrections and additions are welcome, whether submitted as config file entries or sent to me to deal with myself.
+## Quick Start
 
-Phase II will add behavioral config & control to make each source behave as desired, and to orchestrate patterns across the entire simulated network. Scenarios will be prompts to an LLM that generates the behavioral configurations for the sources with which supervent has been configured. To be 100% clear, all event texts will be generated from scratch by supervent code. There'll be no way for an AI to accidentally leak personal or company-confidential info from its training data into the event stream.
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-# Disclosure
-I am a 50% part-time consultant to Axiom (axiom.co), for whom I write marketing stuff. This is my own free-time project.
+2. Configure your event sources and patterns in config.yaml:
+```yaml
+sources:
+  web_server:
+    description: "Web server logs"
+    attributes:
+      # Define attributes and their possible values
+    event_types:
+      # Define event types and their formats
+    
+dependencies:
+  # Define event chains across sources
+```
+3. Run the generator:
 
-Paul Boutin
-boutin@gmail.com
+### Prerequisites
+- Python 3.8 or higher
+- Required packages: install using `pip install -r requirements.txt`
+- Configuration file (see `config/config.yaml` for example)
+
+### Basic Usage
+
+```bash
+# Send events to Axiom
+python supervent.py -c config/config.yaml --output axiom -d your_dataset -t your_token
+
+# Send events to PostgreSQL
+python supervent.py -c config/config.yaml --output postgres \
+    --pg-host localhost \
+    --pg-db your_database \
+    --pg-user your_user \
+    --pg-password your_password
+```
+
+#### Command Line Options
+- -c, --config        Path to configuration YAML file (default: config/config.yaml)
+- --output           Choose output destination: 'axiom' or 'postgres'
+
+#### Axiom options:
+- -d, --dataset      Axiom dataset name
+- -t, --token        Axiom API token (can also use AXIOM_TOKEN environment variable)
+
+#### PostgreSQL options:
+--pg-host          PostgreSQL host (default: localhost)
+--pg-port          PostgreSQL port (default: 5432)
+--pg-db            PostgreSQL database name
+--pg-user          PostgreSQL username
+--pg-password      PostgreSQL password
+--pg-table         PostgreSQL table name (default: events)
+
+#### Environment Variables
+- AXIOM_TOKEN: Your Axiom API token
+- POSTGRES_HOST: PostgreSQL host
+- POSTGRES_PORT: PostgreSQL port
+- POSTGRES_DB: PostgreSQL database name
+- POSTGRES_USER: PostgreSQL username
+- POSTGRES_PASSWORD: PostgreSQL password
+
+#### Example
+```Bash
+# Using environment variables
+export AXIOM_TOKEN=your_token
+python supervent.py -c config/config.yaml --output axiom -d your_dataset
+
+# Or direct command line
+python supervent.py -c config/config.yaml --output axiom -d your_dataset -t your_token
+The generator will create events based on your configuration file, including dependent events through configured event chains. Progress and completion information will be displayed in the console.
+```
+
+
