@@ -1,8 +1,8 @@
 # Realistic Log Generator
 
-A configurable, pattern-aware log generator that creates interconnected events across multiple system components. Designed to simulate realistic application ecosystems for testing, development, and training purposes.
+A configurable, pattern-aware log generator that creates interconnected events across multiple system components. Designed to simulate realistic network ecosystems for demo, testing and training purposes.
 
-The current implementation, branch 3.0, generates syntactically correct but semantically meaningless events. It's one thing to generate syntactically valid logs, but quite another to generate logs that tell a coherent story about system behavior. Real system events have important patterns and correlations that this simplified version doesn't capture, such as:
+The current implementation, branch 3.0, generates realistic but semantically meaningless events. It's one thing to generate syntactically valid logs, but quite another to generate logs that tell a coherent story about system behavior. Real system events have important patterns and correlations that this simplified version doesn't capture, such as:
 
 - Business hours patterns vs off-hours
 - Realistic error cascades
